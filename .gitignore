@@ -1,0 +1,7 @@
+# Real API keys live in .env. Never commit it.
+.env
+
+# Raw run logs hold full prompts and replies. Publish a curated release on purpose, not by accident.
+data-*/
+
+__pycache__/
