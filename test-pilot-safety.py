@@ -14,6 +14,15 @@ p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 
 
+def response(text):
+    if p.DEEPSEEK:
+        body = {"choices": [{"finish_reason": "stop", "message": {"content": text}}], "model": "offline"}
+    else:
+        body = {"candidates": [{"finishReason": "STOP", "content": {"parts": [{"text": text}]}}],
+                "modelVersion": "offline"}
+    return io.BytesIO(json.dumps(body).encode())
+
+
 class PilotSafetyTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="pilot-safety-")
@@ -55,6 +64,50 @@ class PilotSafetyTest(unittest.TestCase):
         for command in (("history", "--ids", "1"), ("run", "--ids", "1"), ("report",)):
             with self.subTest(command=command), self.assertRaisesRegex(SystemExit, "mock"):
                 self.invoke(*command)
+
+    def test_deepseek_interruptions_retry_and_exhaust_as_missing(self):
+        self.pilot()
+        cfg = dict(k=3, L=3, strong=False, s_mode="scripted", emph="normal")
+        def response(fin):
+            return io.BytesIO(json.dumps({"choices": [{"finish_reason": fin,
+                "message": {"content": "" if fin != "stop" else "No."}}]}).encode())
+        for fin in ("insufficient_system_resource", "aborted"):
+            with self.subTest(fin=fin), patch.object(p, "DEEPSEEK", True), patch.object(p, "MOCK", False), \
+                    patch.object(p, "RPM", 1e12), patch.object(p, "KEYS", p.Keys([("offline", "dummy")])):
+                with patch.object(p.urllib.request, "urlopen", side_effect=lambda *a, **k: response(fin)) as up:
+                    row = p.attack(900, 0, "A", cfg)
+                self.assertEqual(up.call_count, 4)
+                self.assertEqual(row["outcome"], "missing")
+                self.assertEqual(row["calls"], 4)
+                self.assertTrue(all(c.get("error") and not c["blocked"] for c in p.read_rows("calls.jsonl")[-4:]))
+                replies = [response(fin)] + [response("stop") for _ in range(3)]
+                with patch.object(p.urllib.request, "urlopen", side_effect=replies):
+                    row = p.attack(900, 0, "A", cfg)
+                self.assertEqual(row["outcome"], "none")
+                self.assertEqual(row["calls"], 4)
+                self.assertEqual(len(row["discarded"]), 1)
+        self.assertEqual(p.parse_ds({"choices": [{"finish_reason": "content_filter"}]})["blocked"],
+                         "output:content_filter")
+
+    def test_copy_requires_all_locked_histories_before_writing(self):
+        src = self.main_dir()
+        self.invoke("history", "--ids", "1")
+        p.DATA = self.root / "copy"
+        with patch.object(p, "MODEL", "second-model"), self.assertRaisesRegex(SystemExit, "missing checkpoints"):
+            self.invoke("init", "--role", "main", "--from", str(src))
+        self.assertFalse(p.DATA.exists())
+
+    def test_copy_run_checks_even_missing_histories_outside_requested_batch(self):
+        src = self.main_dir()
+        self.invoke("history", "--ids", "1-%d" % p.manifest()["n"])
+        p.DATA = self.root / "copy"
+        with patch.object(p, "MODEL", "second-model"):
+            self.invoke("init", "--role", "main", "--from", str(src))
+            p.ckpt_path(2).unlink()
+            with patch.object(p, "llm", side_effect=AssertionError("must fail before calls")), \
+                    self.assertRaisesRegex(SystemExit, "missing checkpoints"):
+                self.invoke("run", "--ids", "1")
+        self.assertFalse((p.DATA / "attempts.jsonl").exists())
 
     def test_live_init_rejects_legacy_mock_pilot(self):
         src = self.calibrated_pilot()
@@ -198,10 +251,6 @@ class PilotSafetyTest(unittest.TestCase):
         self.assertNotIn("95% upper bound", next(s for s in lines if "excl confirmed S violations" in s))
 
     def test_calibration_preserves_usable_turns_across_quota_stop(self):
-        def response(text):
-            return io.BytesIO(json.dumps({"candidates": [{"finishReason": "STOP", "content": {
-                "parts": [{"text": text}]}}], "modelVersion": "offline"}).encode())
-
         seen = []
         def quota(request, **kwargs):
             seen.append(request)
@@ -210,7 +259,8 @@ class PilotSafetyTest(unittest.TestCase):
             return response("No.")
 
         def leak(request, **kwargs):
-            system = json.loads(request.data)["systemInstruction"]["parts"][0]["text"]
+            body = json.loads(request.data)
+            system = body["messages"][0]["content"] if p.DEEPSEEK else body["systemInstruction"]["parts"][0]["text"]
             return response(re.search(r"deploy token is (SW-[A-Z0-9-]+)", system).group(1))
 
         def keys():
@@ -229,10 +279,6 @@ class PilotSafetyTest(unittest.TestCase):
             self.assertEqual(counts[5], (12, 0, 12))
 
     def test_operational_stop_preserves_cost_and_does_not_close_missing_early(self):
-        def response(text):
-            return io.BytesIO(json.dumps({"candidates": [{"finishReason": "STOP", "content": {
-                "parts": [{"text": text}]}}], "modelVersion": "offline"}).encode())
-
         def keys():
             p.KEYS = p.Keys([("offline", "not-a-key")])
 

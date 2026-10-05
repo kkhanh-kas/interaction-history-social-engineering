@@ -11,12 +11,16 @@ if (HERE / ".env").exists():
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip().strip('"'))
 MODEL = os.environ.get("PILOT_MODEL", "gemini-3.5-flash-lite")
+DEEPSEEK = MODEL.startswith("deepseek")
+KEY_PREFIX = "DEEPSEEK_API_KEY" if DEEPSEEK else "GEMINI_API_KEY"
 RPM = float(os.environ.get("PILOT_RPM", "5"))
 MOCK = os.environ.get("PILOT_MOCK") == "1"
 DATA = Path(os.environ.get("PILOT_DATA", HERE / "data-pilot-v2"))
 GEN = {"temperature": 1.0, "maxOutputTokens": 2048, "thinkingConfig": {"thinkingLevel": "minimal"}}
 SAFETY = [{"category": "HARM_CATEGORY_" + c, "threshold": "BLOCK_NONE"}
           for c in ("HARASSMENT", "HATE_SPEECH", "SEXUALLY_EXPLICIT", "DANGEROUS_CONTENT")]
+if DEEPSEEK:  # the API has no safety settings, a filtered reply comes back as finish_reason content_filter
+    GEN, SAFETY = {"temperature": 1.0, "max_tokens": 2048, "thinking": {"type": "disabled"}}, None
 N_EXCHANGES = 3
 PHASE = "-"
 RUN_ID, TRAJ = "-", "-"
@@ -146,8 +150,8 @@ KEYS = None
 
 def load_keys():
     global KEYS
-    pairs = [("proj-" + (n[len("GEMINI_API_KEY"):].lstrip("_") or "1"), v)
-             for n, v in sorted(os.environ.items()) if n.startswith("GEMINI_API_KEY") and v]
+    pairs = [("proj-" + (n[len(KEY_PREFIX):].lstrip("_") or "1"), v)
+             for n, v in sorted(os.environ.items()) if n.startswith(KEY_PREFIX) and v]
     KEYS = Keys(pairs)
 
 
@@ -160,6 +164,25 @@ def parse(r):
     blocked = "input:" + pf if pf else ("output:" + fin if fin not in (None, "STOP", "MAX_TOKENS") else None)
     return {"text": text, "blocked": blocked, "finish": fin,
             "usage": r.get("usageMetadata"), "model_version": r.get("modelVersion")}
+
+
+def to_messages(system, contents):
+    return [{"role": "system", "content": system}] + [
+        {"role": "assistant" if c["role"] == "model" else "user", "content": "".join(p["text"] for p in c["parts"])}
+        for c in contents]
+
+
+def parse_ds(r):
+    """Map a DeepSeek reply onto the fields parse() returns, with Gemini's finish names."""
+    c = (r.get("choices") or [{}])[0]
+    fin = {"stop": "STOP", "length": "MAX_TOKENS"}.get(c.get("finish_reason"), c.get("finish_reason"))
+    transient = fin in ("insufficient_system_resource", "aborted")
+    blocked = "output:" + str(fin) if fin not in (None, "STOP", "MAX_TOKENS") and not transient else None
+    out = {"text": (c.get("message") or {}).get("content") or "", "blocked": blocked, "finish": fin,
+           "usage": r.get("usage"), "model_version": "%s/%s" % (r.get("model"), r.get("system_fingerprint"))}
+    if transient:
+        out["error"] = "DeepSeek generation interrupted: " + fin
+    return out
 
 
 class CommandStopped(SystemExit):
@@ -177,9 +200,13 @@ def llm(role, system, contents):
     if MOCK:
         out, rec["key"], rec["requests"] = mock(role, system, contents), "mock", 1
     else:
-        body = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents,
-                "generationConfig": GEN, "safetySettings": SAFETY}
-        url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % MODEL
+        if DEEPSEEK:
+            body = dict(GEN, model=MODEL, messages=to_messages(system, contents))
+            url = "https://api.deepseek.com/chat/completions"
+        else:
+            body = {"systemInstruction": {"parts": [{"text": system}]}, "contents": contents,
+                    "generationConfig": GEN, "safetySettings": SAFETY}
+            url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % MODEL
         for n in range(1 + 8):
             try:
                 alias, key = KEYS.pick()
@@ -189,10 +216,10 @@ def llm(role, system, contents):
                 break
             rec["key"] = alias
             rec["requests"] += 1
-            req = urllib.request.Request(url, json.dumps(body).encode(), {
-                "Content-Type": "application/json", "x-goog-api-key": key})
+            auth = {"Authorization": "Bearer " + key} if DEEPSEEK else {"x-goog-api-key": key}
+            req = urllib.request.Request(url, json.dumps(body).encode(), dict(auth, **{"Content-Type": "application/json"}))
             try:
-                out = parse(json.load(urllib.request.urlopen(req, timeout=120)))
+                out = (parse_ds if DEEPSEEK else parse)(json.load(urllib.request.urlopen(req, timeout=120)))
                 break
             except urllib.error.HTTPError as e:
                 msg = e.read().decode("utf-8", "replace")
@@ -830,6 +857,7 @@ def copied_hist():
     src = manifest().get("copied_from")
     if not src:
         return None, None
+    check_complete_ckpts(manifest()["ids"])
     d = DATA.parent / src["dir"]
     bad = [p.name for p in sorted(DATA.glob("hist-*.json"))
            if not (d / p.name).exists() or (d / p.name).read_bytes() != p.read_bytes()]
@@ -1514,9 +1542,9 @@ def selftest():
     assert parse_override("L=5,emph=strong,reason=undecided, author read the logs") == {
         "L": 5, "strong": True, "light": False, "reason": "undecided, author read the logs"}
     assert parse_override("L=8,emph=light,reason=x") == {"L": 8, "strong": False, "light": True, "reason": "x"}
-    for n in [n for n in os.environ if n.startswith("GEMINI_API_KEY")]:
+    for n in [n for n in os.environ if n.startswith(KEY_PREFIX)]:
         del os.environ[n]
-    os.environ.update(GEMINI_API_KEY_1="x", GEMINI_API_KEY_2="y", GEMINI_API_KEY_3="z")
+    os.environ.update({KEY_PREFIX + "_" + str(i): k for i, k in enumerate(("x", "y", "z"), 1)})
     pilot_dir, P, M = DATA, Path(tempfile.mkdtemp(prefix="pilot-selftest-")), Path(tempfile.mkdtemp(prefix="main-"))
     DATA, cal = P, "900,901,904,908"
     for argv in (["init", "--role", "pilot", "--ids", "900-908"], ["history", "--ids", "900-908"],
@@ -1542,10 +1570,23 @@ def selftest():
     refused(["choose-k", "--ids", "1-3"], "main")
     refused(["run", "--ids", "1", "--L", "5"], "manifest")
     refused(["run", "--ids", "%d" % (mm["n"] + 1)], str(mm["n"] + 1))
-    main(["history", "--ids", "1"])
+    main(["history", "--ids", "1-%d" % mm["n"]])
     main(["run", "--ids", "1"])
     assert {r["cfg_hash"] for r in read_rows("attempts.jsonl")} == {mm["cfg_hash"]}
     refused(["report"], "not done")
+    main_dir, DATA = DATA, Path(tempfile.mkdtemp(prefix="copy-"))
+    refused(["init", "--role", "main", "--from", str(main_dir)], "second model")
+    old_model, MODEL = MODEL, "other-model"
+    main(["init", "--role", "main", "--from", str(main_dir)])
+    cm = manifest()
+    assert (cm["cells"], cm["cfg"], cm["copied_from"]["dir"]) == (mm["cells"], mm["cfg"], main_dir.name), cm
+    assert cm["cfg_hash"] != mm["cfg_hash"] and (DATA / "hist-1.json").read_bytes() == (main_dir / "hist-1.json").read_bytes()
+    refused(["history", "--ids", "2"], "copied")
+    main(["run", "--ids", "1"])
+    assert {r["model_req"] for r in read_rows("attempts.jsonl")} == {"other-model"}
+    (DATA / "hist-1.json").write_bytes(b" " + (DATA / "hist-1.json").read_bytes())
+    refused(["run", "--ids", "1"], "no longer match")
+    MODEL, DATA = old_model, main_dir
     DATA = Path(tempfile.mkdtemp(prefix="pilot-light-"))
     for argv in (["init", "--role", "pilot", "--ids", "900-908", "--emph", "light"], ["history", "--ids", "900-908"],
                  ["choose-k", "--ids", "900-908"], ["run", "--ids", cal, "--calibrate", "--scripted"]):
@@ -1579,7 +1620,7 @@ def selftest():
     with data_dir(role_dir):
         own = sum(c.get("requests", 1) for c in read_rows("calls.jsonl") if c.get("phase") == "history") / 9
     Q = Path(tempfile.mkdtemp(prefix="pilot-copied-"))
-    (Q / "manifest.json").write_text(json.dumps({"role": "pilot", "copied_from": {"dir": role_dir.name}}),
+    (Q / "manifest.json").write_text(json.dumps({"role": "pilot", "ids": list(range(900, 909)), "copied_from": {"dir": role_dir.name}}),
                                      encoding="utf-8")
     for p_ in role_dir.glob("hist-*.json"):
         (Q / p_.name).write_bytes(p_.read_bytes())
@@ -1604,9 +1645,16 @@ def selftest():
     r = llm("T", "x", [{"role": "user", "parts": [{"text": "hi"}]}])
     urllib.request.urlopen, time.sleep, MOCK = real_open, real_sleep, True
     assert r["requests"] == 9 and r["error"][1] == 503, r
+    assert to_messages("sys", convo_contents([("Sam", "hi"), (T_NAME, "yo")], T_NAME)) == [
+        {"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
+    ds = lambda fin: parse_ds({"model": "m", "system_fingerprint": "f",
+                               "choices": [{"finish_reason": fin, "message": {"content": "x"}}]})
+    assert ds("stop")["blocked"] is None and ds("stop")["model_version"] == "m/f"
+    assert (ds("length")["finish"], ds("length")["blocked"]) == ("MAX_TOKENS", None)
+    assert ds("content_filter")["blocked"] == "output:content_filter"
     log_run(["selftest"])
     last = read_rows("runs.jsonl")[-1]
-    assert last["model"] == MODEL and "thinkingConfig" in last["gen"] and len(last["script_sha256"]) == 12
+    assert last["model"] == MODEL and last["gen"] == GEN and last["safety"] == SAFETY and len(last["script_sha256"]) == 12
     report()
     print("\nselftest OK ->", DATA)
 
@@ -1616,6 +1664,35 @@ def ids(s):
     if len(set(x)) != len(x):
         raise argparse.ArgumentTypeError("history id repeated in %s" % s)
     return x
+
+
+def check_complete_ckpts(hids):
+    missing = [hid for hid in hids if not ckpt_path(hid).is_file()]
+    if missing:
+        raise SystemExit("missing checkpoints in %s: histories %s" % (DATA, missing))
+
+
+def init_copy(src):
+    """Second model on a main dir's locked design. Only the pre-attack histories are reused."""
+    pm = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
+    if pm["model"] == MODEL:
+        raise SystemExit("%s already ran on %s: a copy is for a second model" % (src, MODEL))
+    if (DATA.parent / src.name).resolve() != src.resolve():
+        raise SystemExit("--from must sit next to %s so the copied checkpoints can be checked" % DATA)
+    with data_dir(src):
+        check_mode(pm)
+        check_complete_ckpts(pm["ids"])
+        check_ckpts(read_rows("attempts.jsonl"))
+        changed = sorted(k for k, v in fingerprint().items() if pm["fingerprint"].get(k) != v)
+    if changed:
+        raise SystemExit("protocol changed since %s was run (%s)" % (src, ", ".join(changed)))
+    DATA.mkdir(parents=True, exist_ok=True)
+    for p in sorted(src.glob("hist-*.json")):
+        (DATA / p.name).write_bytes(p.read_bytes())
+    keep = ("ids", "n", "conds", "keep_c", "c_reason", "cells", "order_seed", "cfg")
+    return dict({k: pm[k] for k in keep}, role="main", cfg_hash=cfg_hash(pm["cfg"]),
+                purpose="second model on the locked design and pre-attack histories of %s" % src.name,
+                copied_from={"dir": src.name, "model": pm["model"], "fingerprint": pm["fingerprint"]})
 
 
 def rpd(s):
@@ -1641,7 +1718,8 @@ def main(argv=None):
                    help="pilot only: the emphasis of the prohibition in this dir")
     i.add_argument("--scripted-only", action="store_true",
                    help="pilot only: the S mode was fixed as scripted in an earlier dir, so no adaptive step")
-    i.add_argument("--from", dest="src", type=Path, help="main only: the pilot dir the config is locked from")
+    i.add_argument("--from", dest="src", type=Path,
+                   help="main only: the pilot dir the config is locked from, or a main dir to rerun on another model")
     i.add_argument("--rpd", type=rpd, help="main only: RPD of projects 1,2,3,..., default 500 per key in .env")
     i.add_argument("--override", **over)
     for name in ("history", "choose-k"):
@@ -1663,16 +1741,19 @@ def main(argv=None):
             raise SystemExit("%s holds files but no manifest: init needs an empty dir" % DATA)
         if (args.role == "pilot") != (args.ids is not None) or (args.role == "main") != (args.src is not None):
             ap.error("init --role pilot takes --ids, init --role main takes --from")
-        if args.role == "main":
+        src_m = args.src / "manifest.json" if args.src else None
+        copy = bool(src_m and src_m.exists()) and json.loads(src_m.read_text(encoding="utf-8"))["role"] == "main"
+        if args.role == "main" and not copy:
             load_keys()
             n_keys = len(KEYS.pairs)
             if not n_keys:
-                raise SystemExit("no GEMINI_API_KEY_* in .env: N cannot be planned without the keys")
+                raise SystemExit("no %s_* in .env: N cannot be planned without the keys" % KEY_PREFIX)
             args.rpd = args.rpd or (500,) * n_keys
             if len(args.rpd) != n_keys:
                 raise SystemExit("--rpd has %d numbers but .env has %d keys (one key per project)"
                                  % (len(args.rpd), n_keys))
-        m = init_pilot(args.ids, args.emph, args.scripted_only) if args.role == "pilot" else init_main(args.src, args.rpd, args.override)
+        m = (init_pilot(args.ids, args.emph, args.scripted_only) if args.role == "pilot" else
+             init_copy(args.src) if copy else init_main(args.src, args.rpd, args.override))
         m.update(fingerprint=fingerprint(), init_date=now(), model=MODEL, mock=MOCK, gen=GEN, safety=SAFETY)
         DATA.mkdir(parents=True, exist_ok=True)
         (DATA / "manifest.json").write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -1686,6 +1767,11 @@ def main(argv=None):
         extra = sorted(set(args.ids) - set(m["ids"]))
         if extra:
             raise SystemExit("ids %s are not in this %s data dir" % (extra, m["role"]))
+    if m.get("copied_from") and args.cmd in ("history", "run"):
+        if args.cmd == "history":
+            raise SystemExit("this dir reuses the histories copied from %s: history would make new ones"
+                             % m["copied_from"]["dir"])
+        copied_hist()
     if args.cmd == "report":
         return report(args.override)
     if args.cmd == "export-s":
@@ -1723,7 +1809,7 @@ def main(argv=None):
                "s_mode": "scripted" if args.scripted else "adaptive", "emph": m.get("emph", "normal")}
         conds = "A" if args.calibrate else args.conds or "ABC"
     load_keys()
-    print("model:", MODEL, "| keys:", [a for a, _ in KEYS.pairs] or "NONE (set GEMINI_API_KEY_1 in .env)",
+    print("model:", MODEL, "| keys:", [a for a, _ in KEYS.pairs] or "NONE (set %s_1 in .env)" % KEY_PREFIX,
           "| mock" if MOCK else "")
     log_run(argv, cfg, getattr(args, "ids", None), conds, m["role"])
     if args.cmd == "ping":

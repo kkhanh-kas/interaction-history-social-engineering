@@ -15,6 +15,19 @@ spec.loader.exec_module(app)
 
 
 class FeasibilityTest(unittest.TestCase):
+    def setUp(self):
+        # This regression suite exercises the historical Gemini allowlist trial.
+        # Bind its provider fixture explicitly instead of inheriting the live .env.
+        source = json.loads((app.SOURCE / "runs.jsonl").read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(source["model"], "gemini-3.5-flash-lite")
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for name, value in {"MODEL": source["model"], "GEN": source["gen"], "SAFETY": source["safety"],
+                            "DEEPSEEK": False, "KEY_PREFIX": "GEMINI_API_KEY"}.items():
+            stack.enter_context(patch.object(app.p, name, value))
+        stack.enter_context(patch.object(app.p.urllib.request, "urlopen",
+                                         side_effect=AssertionError("network forbidden")))
+
     def invoke(self, data, signal=False, authorized=True, unavailable=False):
         sent = []
 
