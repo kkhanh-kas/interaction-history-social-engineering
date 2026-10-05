@@ -1,9 +1,3 @@
-"""One bounded feasibility trial with an explicit recipient list. It never starts a main run.
-
-Run: python allowlist-feasibility.py --data data-pilot-allowlist
-Uses existing checkpoints, six authorized-recipient controls, then twelve A trials.
-Full requests stay in the data directory. No keys or raw results belong in Git.
-"""
 import argparse
 import hashlib
 import json
